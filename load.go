@@ -25,6 +25,7 @@ var (
 	writePercent   int
 	duration       time.Duration
 	qps            int
+	concurrency    int
 	readCommitted  bool
 	readCount      uint64
 	writeCount     uint64
@@ -41,6 +42,7 @@ func main() {
 		Run:   handleRun,
 	}
 	runCmd.PersistentFlags().IntVar(&qps, "qps", 100, "number of queries to run per second")
+	runCmd.PersistentFlags().IntVar(&concurrency, "concurrency", 10, "number of workers to run concurrently")
 	runCmd.PersistentFlags().DurationVar(&duration, "duration", time.Minute*10, "duration of test")
 	runCmd.PersistentFlags().IntVar(&writePercent, "write-percent", 10, "number of writes as a percentage of total statements")
 	runCmd.PersistentFlags().BoolVar(&readCommitted, "read-committed", false, "run statements with READ COMMITTED isolation")
@@ -67,7 +69,7 @@ func handleInit(cmd *cobra.Command, args []string) {
 		log.Fatalf("missing --url argument")
 	}
 
-	db := database.MustConnect(url)
+	db := database.MustConnect(url, concurrency)
 
 	if err := database.Create(db); err != nil {
 		log.Fatalf("error creating database: %v", err)
@@ -83,7 +85,7 @@ func handleRun(cmd *cobra.Command, args []string) {
 		log.Fatalf("missing --url argument")
 	}
 
-	db := database.MustConnect(url)
+	db := database.MustConnect(url, concurrency)
 
 	var err error
 	if productIDs, err = database.FetchIDs(db); err != nil {
@@ -97,11 +99,13 @@ func handleRun(cmd *cobra.Command, args []string) {
 		"Sample size:     %d products\n"+
 			"Isolation level: %s\n"+
 			"Reads/s:         %d\n"+
-			"Writes/s:        %d\n",
+			"Writes/s:        %d\n"+
+			"Workers:         %d\n",
 		len(productIDs),
 		lo.Ternary(readCommitted, "READ COMMITTED", "SERIALIZABLE"),
 		readRate,
 		writeRate,
+		concurrency,
 	)
 
 	kill := make(chan struct{})
@@ -117,7 +121,7 @@ func write(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
 	const stmt = `UPDATE product SET name = $1, price = $2 WHERE id = $3`
 
 	t := throttle.New(int64(rate), time.Second)
-	s := semaphore.New(20)
+	s := semaphore.New(concurrency)
 
 	// Allow the reader to be cancelled when the test is finished.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -156,7 +160,7 @@ func read(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
 								WHERE id = $1`
 
 	t := throttle.New(int64(rate), time.Second)
-	s := semaphore.New(20)
+	s := semaphore.New(concurrency)
 
 	// Allow the reader to be cancelled when the test is finished.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -226,14 +230,4 @@ func printLoop(kill <-chan struct{}) {
 			return
 		}
 	}
-}
-
-func txOptions() pgx.TxOptions {
-	if readCommitted {
-		return pgx.TxOptions{
-			IsoLevel: pgx.ReadCommitted,
-		}
-	}
-
-	return pgx.TxOptions{}
 }

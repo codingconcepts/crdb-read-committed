@@ -10,12 +10,14 @@ import (
 
 // MustConnect makes a connection to the database and fails if one
 // can't be established.
-func MustConnect(url string) *pgxpool.Pool {
+func MustConnect(url string, concurrency int) *pgxpool.Pool {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		log.Fatalf("error parsing connection string: %v", err)
 	}
-	cfg.MaxConns = 100
+
+	// Open enough connections for both readers and writers.
+	cfg.MaxConns = int32(concurrency) * 2
 
 	db, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
