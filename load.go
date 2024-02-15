@@ -42,7 +42,7 @@ func main() {
 		Run:   handleRun,
 	}
 	runCmd.PersistentFlags().IntVar(&qps, "qps", 100, "number of queries to run per second")
-	runCmd.PersistentFlags().IntVar(&concurrency, "concurrency", 10, "number of workers to run concurrently")
+	runCmd.PersistentFlags().IntVar(&concurrency, "concurrency", 8, "number of workers to run concurrently")
 	runCmd.PersistentFlags().DurationVar(&duration, "duration", time.Minute*10, "duration of test")
 	runCmd.PersistentFlags().IntVar(&writePercent, "write-percent", 10, "number of writes as a percentage of total statements")
 	runCmd.PersistentFlags().BoolVar(&readCommitted, "read-committed", false, "run statements with READ COMMITTED isolation")
@@ -92,14 +92,14 @@ func handleRun(cmd *cobra.Command, args []string) {
 		log.Fatalf("error fetching ids ahead of test: %v", err)
 	}
 
-	writeRate := qps / writePercent
-	readRate := qps - writeRate
+	writeRate := (float64(writePercent) / 100) * float64(qps)
+	readRate := float64(qps) - writeRate
 
 	fmt.Printf(
 		"Sample size:     %d products\n"+
 			"Isolation level: %s\n"+
-			"Reads/s:         %d\n"+
-			"Writes/s:        %d\n"+
+			"Reads/s:         %.0f\n"+
+			"Writes/s:        %.0f\n"+
 			"Workers:         %d\n",
 		len(productIDs),
 		lo.Ternary(readCommitted, "READ COMMITTED", "SERIALIZABLE"),
@@ -110,15 +110,16 @@ func handleRun(cmd *cobra.Command, args []string) {
 
 	kill := make(chan struct{})
 	go printLoop(kill)
-	go read(db, readRate, kill)
-	go write(db, writeRate, kill)
+	go read(db, int(readRate), kill)
+	go write(db, int(writeRate), kill)
 
 	<-time.After(duration)
 	kill <- struct{}{}
 }
 
 func write(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
-	const stmt = `UPDATE product SET name = $1, price = $2 WHERE id = $3`
+	const stmtSelect = `SELECT price FROM product WHERE id = $1`
+	const stmtUpdate = `UPDATE product SET price = $1 WHERE id = $2`
 
 	t := throttle.New(int64(rate), time.Second)
 	s := semaphore.New(concurrency)
@@ -137,10 +138,18 @@ func write(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
 			start := time.Now()
 			opts := txOptions()
 			err := crdbpgx.ExecuteTx(ctx, db, opts, func(tx pgx.Tx) error {
-				name, price := database.Product()
-				_, err := tx.Exec(ctx, stmt, name, price, id)
+				row := tx.QueryRow(ctx, stmtSelect, id)
 
-				return err
+				var price float64
+				if err := row.Scan(&price); err != nil {
+					return fmt.Errorf("scanning row: %w", err)
+				}
+
+				if _, err := tx.Exec(ctx, stmtUpdate, price+1, id); err != nil {
+					return fmt.Errorf("updating row: %w", err)
+				}
+
+				return nil
 			})
 
 			if err != nil {
@@ -230,4 +239,14 @@ func printLoop(kill <-chan struct{}) {
 			return
 		}
 	}
+}
+
+func txOptions() pgx.TxOptions {
+	if readCommitted {
+		return pgx.TxOptions{
+			IsoLevel: lo.Ternary(readCommitted, pgx.ReadCommitted, pgx.Serializable),
+		}
+	}
+
+	return pgx.TxOptions{}
 }

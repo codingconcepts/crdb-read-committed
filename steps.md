@@ -26,7 +26,7 @@ go run load.go run \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --write-percent 10 \
   --duration 10s \
-  --qps 1000
+  --qps 100
 ```
 
 Enable READ COMMITTED
@@ -56,4 +56,20 @@ Destroy
 docker compose down
 ```
 
-LOOK FOR GOOD USE CASES FOR READ COMMITTED
+```
+s - 10
+avg read latency:  23ms
+avg write latency: 89ms
+
+s - 50
+avg read latency:  23ms
+avg write latency: 85ms
+
+rc - 10
+avg read latency:  21ms
+avg write latency: 87ms
+
+rc - 50
+avg read latency:  23ms
+avg write latency: 90ms
+```
