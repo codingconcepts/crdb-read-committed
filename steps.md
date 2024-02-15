@@ -25,7 +25,7 @@ Run workload (SERIALIZABLE)
 go run load.go run \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --write-percent 10 \
-  --duration 1m \
+  --duration 10s \
   --qps 1000
 ```
 
@@ -45,7 +45,7 @@ Run workload (READ COMMITTED)
 go run load.go run \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --write-percent 10 \
-  --duration 1m \
+  --duration 10s \
   --qps 1000 \
   --read-committed
 ```

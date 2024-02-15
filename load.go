@@ -28,8 +28,8 @@ var (
 	readCommitted  bool
 	readCount      uint64
 	writeCount     uint64
-	readLatencies  = ring.New[time.Duration](1000)
-	writeLatencies = ring.New[time.Duration](1000)
+	readLatencies  = ring.New[time.Duration](5000)
+	writeLatencies = ring.New[time.Duration](5000)
 
 	productIDs []string
 )
@@ -90,25 +90,33 @@ func handleRun(cmd *cobra.Command, args []string) {
 		log.Fatalf("error fetching ids ahead of test: %v", err)
 	}
 
+	writeRate := qps / writePercent
+	readRate := qps - writeRate
+
 	fmt.Printf(
-		"load testing will cover %d products with %s isolation",
+		"Sample size:     %d products\n"+
+			"Isolation level: %s\n"+
+			"Reads/s:         %d\n"+
+			"Writes/s:        %d\n",
 		len(productIDs),
 		lo.Ternary(readCommitted, "READ COMMITTED", "SERIALIZABLE"),
+		readRate,
+		writeRate,
 	)
 
 	kill := make(chan struct{})
 	go printLoop(kill)
-	go read(db, kill)
-	go write(db, kill)
+	go read(db, readRate, kill)
+	go write(db, writeRate, kill)
 
 	<-time.After(duration)
 	kill <- struct{}{}
 }
 
-func write(db *pgxpool.Pool, kill <-chan struct{}) {
+func write(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
 	const stmt = `UPDATE product SET name = $1, price = $2 WHERE id = $3`
 
-	t := throttle.New(int64(qps), time.Second)
+	t := throttle.New(int64(rate), time.Second)
 	s := semaphore.New(20)
 
 	// Allow the reader to be cancelled when the test is finished.
@@ -119,10 +127,6 @@ func write(db *pgxpool.Pool, kill <-chan struct{}) {
 	}()
 
 	t.DoFor(ctx, duration, func() error {
-		if rand.Intn(100) > writePercent {
-			return nil
-		}
-
 		id := productIDs[rand.Intn(len(productIDs))]
 
 		s.Run(func() {
@@ -146,12 +150,12 @@ func write(db *pgxpool.Pool, kill <-chan struct{}) {
 	})
 }
 
-func read(db *pgxpool.Pool, kill <-chan struct{}) {
+func read(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
 	const stmt = `SELECT name, price
 								FROM product
 								WHERE id = $1`
 
-	t := throttle.New(int64(qps), time.Second)
+	t := throttle.New(int64(rate), time.Second)
 	s := semaphore.New(20)
 
 	// Allow the reader to be cancelled when the test is finished.
@@ -162,10 +166,6 @@ func read(db *pgxpool.Pool, kill <-chan struct{}) {
 	}()
 
 	t.DoFor(ctx, duration, func() error {
-		if rand.Intn(100) < writePercent || len(productIDs) == 0 {
-			return nil
-		}
-
 		id := productIDs[rand.Intn(len(productIDs))]
 
 		s.Run(func() {
