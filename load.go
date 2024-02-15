@@ -8,12 +8,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/brianvoe/gofakeit/v6"
 	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
+	"github.com/codingconcepts/crdb-read-committed/pkg/database"
 	"github.com/codingconcepts/ring"
 	"github.com/codingconcepts/semaphore"
 	"github.com/codingconcepts/throttle"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samber/lo"
@@ -68,59 +67,15 @@ func handleInit(cmd *cobra.Command, args []string) {
 		log.Fatalf("missing --url argument")
 	}
 
-	db := mustConnect()
+	db := database.MustConnect(url)
 
-	if err := create(db); err != nil {
+	if err := database.Create(db); err != nil {
 		log.Fatalf("error creating database: %v", err)
 	}
 
-	if err := seed(db, seedRows); err != nil {
+	if err := database.Seed(db, seedRows); err != nil {
 		log.Fatalf("error seeding database: %v", err)
 	}
-}
-
-func mustConnect() *pgxpool.Pool {
-	cfg, err := pgxpool.ParseConfig(url)
-	if err != nil {
-		log.Fatalf("error parsing connection string: %v", err)
-	}
-	cfg.MaxConns = 100
-
-	db, err := pgxpool.NewWithConfig(context.Background(), cfg)
-	if err != nil {
-		log.Fatalf("error connecting to db: %v", err)
-	}
-
-	return db
-}
-
-func create(db *pgxpool.Pool) error {
-	const stmt = `CREATE TABLE product (
-									id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-									name STRING NOT NULL,
-									price DECIMAL NOT NULL
-								)`
-
-	_, err := db.Exec(context.Background(), stmt)
-	return err
-}
-
-func seed(db *pgxpool.Pool, rowCount int) error {
-	const stmt = `INSERT INTO product (id, name, price) VALUES ($1, $2, $3)`
-
-	batch := pgx.Batch{}
-	for i := 0; i < rowCount; i++ {
-		id := uuid.NewString()
-		name, price := product()
-		batch.Queue(stmt, id, name, price)
-
-		productIDs = append(productIDs, id)
-	}
-
-	if _, err := db.SendBatch(context.Background(), &batch).Exec(); err != nil {
-		return fmt.Errorf("running insert job: %w", err)
-	}
-	return nil
 }
 
 func handleRun(cmd *cobra.Command, args []string) {
@@ -128,9 +83,10 @@ func handleRun(cmd *cobra.Command, args []string) {
 		log.Fatalf("missing --url argument")
 	}
 
-	db := mustConnect()
+	db := database.MustConnect(url)
 
-	if err := fetchIDs(db); err != nil {
+	var err error
+	if productIDs, err = database.FetchIDs(db); err != nil {
 		log.Fatalf("error fetching ids ahead of test: %v", err)
 	}
 
@@ -147,25 +103,6 @@ func handleRun(cmd *cobra.Command, args []string) {
 
 	<-time.After(duration)
 	kill <- struct{}{}
-}
-
-func fetchIDs(db *pgxpool.Pool) error {
-	const stmt = `SELECT id FROM product`
-
-	rows, err := db.Query(context.Background(), stmt)
-	if err != nil {
-		return fmt.Errorf("querying for rows: %w", err)
-	}
-
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return fmt.Errorf("scanning id: %w", err)
-		}
-		productIDs = append(productIDs, id)
-	}
-
-	return nil
 }
 
 func write(db *pgxpool.Pool, kill <-chan struct{}) {
@@ -192,7 +129,7 @@ func write(db *pgxpool.Pool, kill <-chan struct{}) {
 			start := time.Now()
 			opts := txOptions()
 			err := crdbpgx.ExecuteTx(ctx, db, opts, func(tx pgx.Tx) error {
-				name, price := product()
+				name, price := database.Product()
 				_, err := tx.Exec(ctx, stmt, name, price, id)
 
 				return err
@@ -254,10 +191,6 @@ func read(db *pgxpool.Pool, kill <-chan struct{}) {
 	})
 }
 
-func product() (string, float64) {
-	return gofakeit.ProductName(), float64(int(gofakeit.Float64Range(1, 100)*100)) / 100
-}
-
 func printLoop(kill <-chan struct{}) {
 	end := time.Now().Add(duration)
 	ticker := time.NewTicker(time.Second).C
@@ -265,6 +198,12 @@ func printLoop(kill <-chan struct{}) {
 	for {
 		select {
 		case <-ticker:
+			// Prevent race condition whereby screen is cleared before it can be interrogated
+			// because kill signal arrives late and the ticker runs one too many times.
+			if time.Now().After(end) {
+				return
+			}
+
 			fmt.Println("\033[H\033[2J")
 
 			fmt.Printf("read count:        %d\n", atomic.LoadUint64(&readCount))
