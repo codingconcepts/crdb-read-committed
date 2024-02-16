@@ -195,6 +195,10 @@ iso-load \
 # act total balance: 100180
 ```
 
+### Thanks
+
+* [Kai Niemi](https://github.com/kai-niemi) for his help in creating this application.
+
 ### Destroy local infrastructure
 
 ``` sh
