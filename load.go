@@ -2,127 +2,139 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
-	"math/rand"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
 	"github.com/codingconcepts/crdb-read-committed/pkg/database"
-	"github.com/codingconcepts/ring"
 	"github.com/codingconcepts/semaphore"
 	"github.com/codingconcepts/throttle"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samber/lo"
-	"github.com/spf13/cobra"
-)
-
-var (
-	url            string
-	seedRows       int
-	writePercent   int
-	duration       time.Duration
-	qps            int
-	concurrency    int
-	readCommitted  bool
-	readCount      uint64
-	writeCount     uint64
-	readLatencies  = ring.New[time.Duration](5000)
-	writeLatencies = ring.New[time.Duration](5000)
-
-	productIDs []string
 )
 
 func main() {
-	runCmd := cobra.Command{
-		Use:   "run",
-		Short: "Start a load test",
-		Run:   handleRun,
+	url := flag.String("url", "postgres://root@localhost:26257?sslmode=disable", "database connection string")
+	qps := flag.Int64("qps", 100, "number of queries to run per second")
+	concurrency := flag.Int("concurrency", 8, "number of workers to run concurrently")
+	duration := flag.Duration("duration", time.Second*10, "duration of test")
+	isolation := flag.String("isolation", "serializable", "isolation to use [read committed | serializable]")
+	accounts := flag.Int("accounts", 100000, "number of accounts to simulate")
+	selection := flag.Int("selection", 10, "number of accounts to work with")
+	flag.Parse()
+
+	r := runner{
+		qps:         *qps,
+		concurrency: *concurrency,
+		duration:    *duration,
+		isolation:   *isolation,
+		accounts:    *accounts,
+		selection:   *selection,
 	}
-	runCmd.PersistentFlags().IntVar(&qps, "qps", 100, "number of queries to run per second")
-	runCmd.PersistentFlags().IntVar(&concurrency, "concurrency", 8, "number of workers to run concurrently")
-	runCmd.PersistentFlags().DurationVar(&duration, "duration", time.Minute*10, "duration of test")
-	runCmd.PersistentFlags().IntVar(&writePercent, "write-percent", 10, "number of writes as a percentage of total statements")
-	runCmd.PersistentFlags().BoolVar(&readCommitted, "read-committed", false, "run statements with READ COMMITTED isolation")
 
-	initCmd := cobra.Command{
-		Use:   "init",
-		Short: "Initialize the database ready for a load test",
-		Run:   handleInit,
+	db := database.MustConnect(*url, r.concurrency)
+
+	if err := r.deinit(db); err != nil {
+		log.Fatalf("error destroying database: %v", err)
 	}
-	initCmd.PersistentFlags().IntVar(&seedRows, "seed-rows", 1000, "number of rows to seed the database with before the load test")
 
-	rootCmd := cobra.Command{}
-	rootCmd.PersistentFlags().StringVar(&url, "url", "", "database connection string")
-	rootCmd.AddCommand(&runCmd, &initCmd)
-	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	if err := r.init(db); err != nil {
+		log.Fatalf("error initialising database: %v", err)
+	}
 
-	if err := rootCmd.Execute(); err != nil {
-		log.Fatalf("error running root command: %v", err)
+	if err := r.run(db); err != nil {
+		log.Fatalf("error running simulation: %v", err)
+	}
+
+	if err := r.summary(db); err != nil {
+		log.Fatalf("error generating summary: %v", err)
 	}
 }
 
-func handleInit(cmd *cobra.Command, args []string) {
-	if url == "" {
-		log.Fatalf("missing --url argument")
+type runner struct {
+	accounts    int
+	selection   int
+	duration    time.Duration
+	qps         int64
+	concurrency int
+	isolation   string
+
+	accountIDs   []string
+	selectionIDs []string
+
+	latencies    latencies
+	requestsMade uint64
+}
+
+type latencies struct {
+	mu     sync.Mutex
+	values []time.Duration
+}
+
+func (l *latencies) add(d time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.values = append(l.values, d)
+}
+
+func (r *runner) init(db *pgxpool.Pool) error {
+	if err := database.Create(db); err != nil {
+		return fmt.Errorf("creating database: %w", err)
 	}
 
-	db := database.MustConnect(url, concurrency)
+	if err := database.Seed(db, r.accounts); err != nil {
+		return fmt.Errorf("seeding database: %w", err)
+	}
 
-	if err := database.Create(db); err != nil {
+	accountIDs, err := database.FetchIDs(db, r.selection)
+	if err != nil {
+		return fmt.Errorf("fetching ids: %w", err)
+	}
+
+	r.accountIDs = accountIDs
+	return nil
+}
+
+func (r *runner) deinit(db *pgxpool.Pool) error {
+	if err := database.Drop(db); err != nil {
 		log.Fatalf("error creating database: %v", err)
 	}
 
-	if err := database.Seed(db, seedRows); err != nil {
-		log.Fatalf("error seeding database: %v", err)
-	}
+	return nil
 }
 
-func handleRun(cmd *cobra.Command, args []string) {
-	if url == "" {
-		log.Fatalf("missing --url argument")
-	}
-
-	db := database.MustConnect(url, concurrency)
-
-	var err error
-	if productIDs, err = database.FetchIDs(db); err != nil {
+func (r *runner) run(db *pgxpool.Pool) error {
+	accountIDs, err := database.FetchIDs(db, r.selection)
+	if err != nil {
 		log.Fatalf("error fetching ids ahead of test: %v", err)
 	}
+	r.selectionIDs = accountIDs
 
-	writeRate := (float64(writePercent) / 100) * float64(qps)
-	readRate := float64(qps) - writeRate
-
-	fmt.Printf(
-		"Sample size:     %d products\n"+
-			"Isolation level: %s\n"+
-			"Reads/s:         %.0f\n"+
-			"Writes/s:        %.0f\n"+
-			"Workers:         %d\n",
-		len(productIDs),
-		lo.Ternary(readCommitted, "READ COMMITTED", "SERIALIZABLE"),
-		readRate,
-		writeRate,
-		concurrency,
-	)
+	fmt.Printf("Sample size:     %d accounts\n", len(accountIDs))
+	fmt.Printf("Isolation level: %s\n", strings.ToUpper(r.isolation))
+	fmt.Printf("Concurrency      %d\n", r.concurrency)
 
 	kill := make(chan struct{})
-	go printLoop(kill)
-	go read(db, int(readRate), kill)
-	go write(db, int(writeRate), kill)
+	go r.printLoop(kill)
+	go r.work(db, kill)
 
-	<-time.After(duration)
+	<-time.After(r.duration)
 	kill <- struct{}{}
+
+	return nil
 }
 
-func write(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
-	const stmtSelect = `SELECT price FROM product WHERE id = $1`
-	const stmtUpdate = `UPDATE product SET price = $1 WHERE id = $2`
-
-	t := throttle.New(int64(rate), time.Second)
-	s := semaphore.New(concurrency)
+func (r *runner) work(db *pgxpool.Pool, kill <-chan struct{}) {
+	t := throttle.New(r.qps, time.Second)
+	s := semaphore.New(r.concurrency)
 
 	// Allow the reader to be cancelled when the test is finished.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -131,81 +143,70 @@ func write(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
 		cancel()
 	}()
 
-	t.DoFor(ctx, duration, func() error {
-		id := productIDs[rand.Intn(len(productIDs))]
-
+	t.DoFor(ctx, r.duration, func() error {
 		s.Run(func() {
-			start := time.Now()
-			opts := txOptions()
-			err := crdbpgx.ExecuteTx(ctx, db, opts, func(tx pgx.Tx) error {
-				row := tx.QueryRow(ctx, stmtSelect, id)
+			ids := lo.Samples(r.selectionIDs, 2)
 
-				var price float64
-				if err := row.Scan(&price); err != nil {
-					return fmt.Errorf("scanning row: %w", err)
+			start := time.Now()
+			opts := txOptions(r.isolation)
+			err := crdbpgx.ExecuteTx(ctx, db, opts, func(tx pgx.Tx) error {
+				// Get balance from source account.
+				balanceSrc, err := database.FetchBalance(ctx, tx, ids[0])
+				if err != nil {
+					return fmt.Errorf("fetching balance from source account: %w", err)
 				}
 
-				if _, err := tx.Exec(ctx, stmtUpdate, price+1, id); err != nil {
-					return fmt.Errorf("updating row: %w", err)
+				// Get balance from destination account.
+				balanceDst, err := database.FetchBalance(ctx, tx, ids[1])
+				if err != nil {
+					return fmt.Errorf("fetching balance from destination account: %w", err)
+				}
+
+				// Perform transfer.
+				if err = database.UpdateBalance(ctx, tx, ids[0], balanceSrc-5); err != nil {
+					return fmt.Errorf("debiting source account: %w", err)
+				}
+				if err = database.UpdateBalance(ctx, tx, ids[1], balanceDst+5); err != nil {
+					return fmt.Errorf("crediting destination account: %w", err)
 				}
 
 				return nil
 			})
 
-			if err != nil {
-				log.Printf("[write] error: %v", err)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("error: %v", err)
 			}
-			writeLatencies.Add(time.Since(start))
-			atomic.AddUint64(&writeCount, 1)
+
+			r.latencies.add(time.Since(start))
+			atomic.AddUint64(&r.requestsMade, 1)
 		})
 
 		return nil
 	})
 }
 
-func read(db *pgxpool.Pool, rate int, kill <-chan struct{}) {
-	const stmt = `SELECT name, price
-								FROM product
-								WHERE id = $1`
+func (r *runner) summary(db *pgxpool.Pool) error {
+	expectedBalanceSum := r.selection * 10000
 
-	t := throttle.New(int64(rate), time.Second)
-	s := semaphore.New(concurrency)
+	actualBalanceSum, err := database.FetchBalancesSum(db, r.selectionIDs)
+	if err != nil {
+		return fmt.Errorf("fetching balance sum: %w", err)
+	}
 
-	// Allow the reader to be cancelled when the test is finished.
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		<-kill
-		cancel()
-	}()
+	fmt.Println("\033[H\033[2J")
+	if len(r.latencies.values) > 0 {
+		fmt.Printf("avg latency:       %dms\n", lo.Sum(r.latencies.values).Milliseconds()/int64(len(r.latencies.values)))
+	}
 
-	t.DoFor(ctx, duration, func() error {
-		id := productIDs[rand.Intn(len(productIDs))]
+	fmt.Printf("total requests:    %d\n", r.requestsMade)
+	fmt.Printf("exp total balance: %d\n", expectedBalanceSum)
+	fmt.Printf("act total balance: %.f\n", actualBalanceSum)
 
-		s.Run(func() {
-			start := time.Now()
-			opts := txOptions()
-			err := crdbpgx.ExecuteTx(ctx, db, opts, func(tx pgx.Tx) error {
-				row := tx.QueryRow(ctx, stmt, id)
-
-				var name string
-				var price float64
-
-				return row.Scan(&name, &price)
-			})
-
-			if err != nil {
-				log.Printf("[read] error: %v", err)
-			}
-			readLatencies.Add(time.Since(start))
-			atomic.AddUint64(&readCount, 1)
-		})
-
-		return nil
-	})
+	return nil
 }
 
-func printLoop(kill <-chan struct{}) {
-	end := time.Now().Add(duration)
+func (r *runner) printLoop(kill <-chan struct{}) {
+	end := time.Now().Add(r.duration)
 	ticker := time.NewTicker(time.Second).C
 
 	for {
@@ -218,22 +219,6 @@ func printLoop(kill <-chan struct{}) {
 			}
 
 			fmt.Println("\033[H\033[2J")
-
-			fmt.Printf("read count:        %d\n", atomic.LoadUint64(&readCount))
-			reads := readLatencies.Slice()
-			if len(reads) > 0 {
-				fmt.Printf("avg read latency:  %dms\n", lo.Sum(reads).Milliseconds()/int64(len(reads)))
-			}
-
-			fmt.Println()
-
-			fmt.Printf("write count:       %d\n", atomic.LoadUint64(&writeCount))
-			writes := writeLatencies.Slice()
-			if len(writes) > 0 {
-				fmt.Printf("avg write latency: %dms\n", lo.Sum(writes).Milliseconds()/int64(len(writes)))
-			}
-
-			fmt.Println()
 			fmt.Printf("time left: %s", time.Until(end).Truncate(time.Second))
 		case <-kill:
 			return
@@ -241,12 +226,13 @@ func printLoop(kill <-chan struct{}) {
 	}
 }
 
-func txOptions() pgx.TxOptions {
-	if readCommitted {
-		return pgx.TxOptions{
-			IsoLevel: lo.Ternary(readCommitted, pgx.ReadCommitted, pgx.Serializable),
-		}
+func txOptions(isolation string) pgx.TxOptions {
+	switch strings.ToUpper(isolation) {
+	case "READ COMMITTED":
+		return pgx.TxOptions{IsoLevel: pgx.ReadCommitted}
+	case "SERIALIZABLE":
+		return pgx.TxOptions{IsoLevel: pgx.Serializable}
 	}
 
-	return pgx.TxOptions{}
+	panic(fmt.Sprintf("invalid isolation level: %s", isolation))
 }

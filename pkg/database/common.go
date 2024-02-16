@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 
-	"github.com/brianvoe/gofakeit/v6"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -25,9 +24,4 @@ func MustConnect(url string, concurrency int) *pgxpool.Pool {
 	}
 
 	return db
-}
-
-// Product returns a random product name and price.
-func Product() (string, float64) {
-	return gofakeit.ProductName(), float64(int(gofakeit.Float64Range(1, 100)*100)) / 100
 }
