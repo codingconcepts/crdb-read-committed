@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,8 @@ import (
 	"github.com/samber/lo"
 )
 
+var version string
+
 func main() {
 	url := flag.String("url", "postgres://root@localhost:26257?sslmode=disable", "database connection string")
 	qps := flag.Int64("qps", 100, "number of queries to run per second")
@@ -28,7 +31,13 @@ func main() {
 	isolation := flag.String("isolation", "serializable", "isolation to use [read committed | serializable]")
 	accounts := flag.Int("accounts", 100000, "number of accounts to simulate")
 	selection := flag.Int("selection", 10, "number of accounts to work with")
+	showVersion := flag.Bool("version", false, "show the application version number")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	r := runner{
 		qps:         *qps,
