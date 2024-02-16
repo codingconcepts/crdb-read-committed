@@ -1,3 +1,42 @@
+# iso-load
+
+Run workloads against a Postgres-compatible database with different isolation levels to see how they perform.
+
+### Installation
+
+1. Download the latest version of the iso-load executable from the [Release](https://github.com/codingconcepts/iso-load/releases/latest) page.
+
+2. Extract the executable with the following command:
+
+``` sh
+tar -xvf iso-load_VERSION_PLATFORM.tar.gz
+```
+
+3. Add the executable to your PATH
+
+4. Run the executable as follows:
+
+``` sh
+iso-load --help
+Usage of ./iso-load:
+  -accounts int
+        number of accounts to simulate (default 100000)
+  -concurrency int
+        number of workers to run concurrently (default 8)
+  -duration duration
+        duration of test (default 10s)
+  -isolation string
+        isolation to use [read committed | serializable] (default "serializable")
+  -qps int
+        number of queries to run per second (default 100)
+  -selection int
+        number of accounts to work with (default 10)
+  -url string
+        database connection string (default "postgres://root@localhost:26257?sslmode=disable")
+  -version
+        show the application version number
+```
+
 ### Create
 
 I'm spinning up a local Docker cluster but will work against any cluster.
@@ -15,17 +54,13 @@ enterprise --url "postgres://root@localhost:26257?sslmode=disable"
 Enable READ COMMITTED
 
 ``` sql
-SHOW CLUSTER SETTING sql.txn.read_committed_isolation.enabled;
-
 SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = 'true';
-
-SHOW CLUSTER SETTING sql.txn.read_committed_isolation.enabled;
 ```
 
 Run workload (SERIALIZABLE)
 
 ``` sh
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "serializable" \
   --accounts 100000 \
@@ -38,7 +73,7 @@ go run load.go \
 # exp total balance: 1000000000
 # act total balance: 1000000000
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "serializable" \
   --accounts 100000 \
@@ -51,7 +86,7 @@ go run load.go \
 # exp total balance: 100000000
 # act total balance: 100000000
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "serializable" \
   --accounts 100000 \
@@ -64,7 +99,7 @@ go run load.go \
 # exp total balance: 10000000
 # act total balance: 10000000
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "serializable" \
   --accounts 100000 \
@@ -77,7 +112,7 @@ go run load.go \
 # exp total balance: 1000000
 # act total balance: 1000000
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "serializable" \
   --accounts 100000 \
@@ -94,7 +129,7 @@ go run load.go \
 Run workload (READ COMMITTED)
 
 ``` sh
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "read committed" \
   --accounts 100000 \
@@ -107,7 +142,7 @@ go run load.go \
 # exp total balance: 1000000000
 # act total balance: 1000000000
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "read committed" \
   --accounts 100000 \
@@ -120,7 +155,7 @@ go run load.go \
 # exp total balance: 100000000
 # act total balance: 100000000
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "read committed" \
   --accounts 100000 \
@@ -133,7 +168,7 @@ go run load.go \
 # exp total balance: 10000000
 # act total balance: 10000005
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "read committed" \
   --accounts 100000 \
@@ -146,7 +181,7 @@ go run load.go \
 # exp total balance: 1000000
 # act total balance: 1000180
 
-go run load.go \
+iso-load \
   --url "postgres://root@localhost:26257?sslmode=disable" \
   --isolation "read committed" \
   --accounts 100000 \
@@ -160,7 +195,7 @@ go run load.go \
 # act total balance: 100180
 ```
 
-Destroy
+### Destroy local infrastructure
 
 ``` sh
 docker compose down
